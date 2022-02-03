@@ -1,0 +1,264 @@
+---
+title: "VDJ"
+author: "Kin Lau"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: true
+---
+
+```{r starttime}
+# save start time for script
+start_tm <- Sys.time()
+start_tm
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=TRUE, cache.lazy = FALSE, dev=c('png','pdf'), fig.width=8, fig.height=8)
+
+```
+
+```{r make_outdir}
+outdir <- "./VDJ_out_files/"
+
+dir.create(outdir, recursive=TRUE)
+```
+
+# Packages loaded
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE}
+library(dplyr)
+library(stringr)
+library(readr)
+library(scRepertoire)
+library(Seurat)
+library(patchwork)
+library(dittoSeq)
+library(circlize)
+library(scales)
+```
+
+# Read in Seurat results
+
+```{r read_integrated_seurat}
+seurat_integrated <- readRDS("../../PCs_scRNAseq_out_files/integrated_Seurat.rds")
+
+# cluster resolution to use for analyzing clusters
+cluster_res <- "integrated_snn_res.0.3"
+
+seurat_integrated[[cluster_res]] <- factor(seurat_integrated[[]][[cluster_res]], 
+                                    levels=as.character(sort(as.numeric(levels(seurat_integrated[[]][[cluster_res]]))))
+)
+Idents(seurat_integrated) <- "integrated_snn_res.0.3"
+
+seurat_integrated$Tissue <- str_extract(seurat_integrated$Sample, "BM|Thy|Sp")
+seurat_integrated$Indiv <- str_extract(seurat_integrated$Sample, "^(Kim|Pete)")
+#seurat_integrated$new_rowname <- paste0(seurat_integrated$Sample, "_", seurat_integrated$Barcode)
+
+# rename the cells to match the VDJ data
+#seurat_integrated2 <- seurat_integrated
+seurat_integrated <- RenameCells(seurat_integrated, new.names = paste0(seurat_integrated$Sample, "_", seurat_integrated$Barcode))
+
+```
+
+
+# Read in VDJ
+
+```{r read_vdj}
+contig_files <- list.files("./raw_data/cellranger_vdj/", recursive = TRUE, 
+                           pattern = "filtered_contig_annotations.csv", 
+                           full.names = TRUE) %>%
+  grep(value = TRUE, pattern = "\\/outs\\/") %>%
+  grep(value=TRUE, pattern = "\\/PC_")
+
+names(contig_files) <- str_extract(contig_files, "PC_[^\\/]+_VDJ")
+names(contig_files) <- str_replace(str_replace(names(contig_files) , "Male", "Kim"), "Female", "Pete")
+names(contig_files) <- unlist(lapply(str_split(names(contig_files), "_"), function(x) paste(x[c(3,2,1)], collapse="_")))
+names(contig_files) <- str_replace(str_replace(names(contig_files), "_SPL_", "_Sp_"), "_THY_", "_Thy_")
+
+contig_list <- lapply(contig_files, function(x){
+  read.csv(x)
+})
+
+combined <- combineBCR(contig_list, samples = str_extract(names(contig_list), "^[^_]+"), ID = str_extract(names(contig_list), "[^_]+_[^_]+$")) #,ID = str_remove_all(str_extract(names(contig_list), "_[^_]+_"), "_")) #  
+
+sample_colors <- dittoColors(1)[13:(13+length(combined)-1)]
+```
+
+# Sumamrize VDJ data only
+
+## How many cells with high-confidence contigs in each sample?
+
+```{r num_cells}
+#unlist(lapply(combined, nrow))
+unlist(lapply(combined, function(x) length(unique(x$barcode))))
+
+```
+
+
+## Quantify Clonotypes
+
+Unique clonotypes divided by total clonotypes. Lower means there is less diversity.
+
+```{r quantify_clonotypes, fig.height=4, fig.width=6}
+quantContig(combined, cloneCall="gene+nt", scale = TRUE) + 
+  theme(axis.text.x = element_text(angle=90,vjust=0.5,hjust=1)) + scale_fill_manual(values=sample_colors)# +
+
+#abundanceContig(combined, cloneCall = "gene+nt", scale = TRUE) #+ scale_fill_manual(values=sample_colors) #+ facet_wrap(~values)
+```
+
+## Length of Clonotypes
+
+Length of the CDR3 region in light and heavy chain IG.
+
+```{r length_of_clonotypes, fig.height=4, fig.width=11}
+#lengthContig(combined, cloneCall="aa", chain = "both", scale=FALSE) + scale_fill_manual(values=sample_colors)
+lengthContig(combined, cloneCall="aa", chain = "IGL", scale=FALSE) + scale_fill_manual(values=sample_colors) + ggtitle("IGL") +
+  lengthContig(combined, cloneCall="aa", chain = "IGH", scale=FALSE) + scale_fill_manual(values=sample_colors) + ggtitle("IGH") +
+  plot_layout(guides="collect")
+
+```
+
+## Clonal proportion
+
+Left figure bins clonotypes based on proportion of cells. Right figure shows essentially the same thing but from a different perspective; from the manual, "ranking of clonotypes by copy or frequency of occurrence, meaning 1:10 are the top 10 clonotypes in each sample."
+
+```{r clonal_proportion, fig.height=4, fig.width=10}
+clonalHomeostasis(combined, cloneCall = "gene+nt") + theme(axis.text.x = element_text(angle=90,vjust=0.5,hjust=1)) +
+  clonalProportion(combined, cloneCall = "gene+nt") + theme(axis.text.x = element_text(angle=90,vjust=0.5,hjust=1))
+
+```
+
+## Overlap Analysis
+
+Here we look at the similarity/overlap of clonotypes between pairs of samples.
+
+```{r overlap_analysis, fig.height=4, fig.width=10}
+#clonalOverlap(combined, cloneCall="gene+nt", method="overlap") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1)) +
+clonalOverlap(combined, cloneCall="gene+nt", method="morisita") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1)) +
+  clonalOverlap(combined, cloneCall="gene+nt", method="jaccard") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1)) 
+```
+
+## Sanity check what Morisita and Jaccard indexes are showing
+
+```{r overlap_analysis_test, fig.height=7, fig.width=12}
+# test to see how jaccard works versus morisita
+combined_new <- c(combined, list(Kim_Sp_PC_mod=combined$Kim_Sp_PC))
+orig_mor <- clonalOverlap(combined_new, cloneCall="gene+nt", method="morisita") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1)) + ggtitle("Original Kim_Sp_PC") 
+orig_jac <- clonalOverlap(combined_new, cloneCall="gene+nt", method="jaccard") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1))  + ggtitle("Original Kim_Sp_PC") 
+
+combined_new <- c(combined, list(Kim_Sp_PC_mod=combined$Kim_Sp_PC %>% group_by(CTstrict) %>% filter(row_number() == 1 ) %>% ungroup() %>% as.data.frame()))
+
+new_mor <- clonalOverlap(combined_new, cloneCall="gene+nt", method="morisita") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1)) + ggtitle("Keep uniq Kim_Sp_PC clonotypes only") #+
+new_jac <- clonalOverlap(combined_new, cloneCall="gene+nt", method="jaccard") + theme(axis.text.x=element_text(angle=90,vjust=0.5,hjust=1))   + ggtitle("Keep uniq Kim_Sp_PC clonotypes only") 
+
+(orig_mor + orig_jac) / (new_mor + new_jac)
+
+```
+
+
+
+```{r diversity_analysis, fig.height=4, fig.width=8, eval=FALSE}
+clonalDiversity(combined, cloneCall = "gene+nt") + scale_fill_manual(values=sample_colors)
+```
+
+
+
+# Merge with Seurat object
+
+## Percent of VDJ barcodes found in scRNA-seq dataset (after filters)
+
+```{r merge_seurat}
+lapply(combined, function(x) {
+  prop.table(table(x$barcode %in% colnames(seurat_integrated)))
+})
+
+seurat <- combineExpression(combined, seurat_integrated, group.by = "none")
+combined2 <- expression2List(seurat, split.by = "cluster")
+```
+
+## Percent of each scRNA-seq sample with a matched VDJ cell
+
+```{r perc_10xsample_w_vdj_match}
+prop.table(table(seurat@meta.data$cloneType, seurat@meta.data$Sample, useNA = "ifany"), 2)
+```
+
+
+## UMAP annotated with clonotype abundance categories
+
+```{r umap, fig.width=12, fig.height=6}
+seurat$cloneType <- factor(seurat$cloneType)
+dittoDimPlot(seurat, "cloneType", split.by="Sample") +
+dittoBarPlot(seurat, "cloneType", group.by = "Sample", split.by = "Tissue", 
+             retain.factor.levels=TRUE, split.adjust=list(scales="free_x")) +
+  plot_layout(guides="collect", widths = c(2,1))
+```
+
+## Distribution of the clonotype abundance categories across clusters
+
+```{r clonotype_abund_in_clusters}
+dittoBarPlot(seurat, "cloneType", group.by = cluster_res, 
+             retain.factor.levels=TRUE, split.adjust=list(scales="free_x"))
+```
+
+
+## Overlap Analysis between clusters
+
+```{r overlap_analysis_clusters, fig.width=7}
+#clonalDiversity(combined2)
+clonalOverlap(combined2, cloneCall="gene+nt", method="jaccard") /
+clonalOverlap(combined2, cloneCall="gene+nt", method="morisita") 
+
+
+```
+
+## Clonotypes shared between clusters
+
+```{r shared_clonotypes_bet_clusters}
+circles <- getCirclize(seurat, group.by = "cluster")
+
+#Just assigning the normal colors to each cluster
+grid.cols <- scales::hue_pal()(length(unique(seurat@active.ident)))
+names(grid.cols) <- levels(seurat@active.ident)
+
+#Graphing the chord diagram
+circlize::chordDiagram(circles, self.link = 1, grid.col = grid.cols)
+
+```
+
+## Clonotypes shared between samples
+
+```{r shared_clonotypes_bet_samples}
+circles <- getCirclize(seurat, group.by = "Sample")
+
+#Just assigning the normal colors to each cluster
+grid.cols <- scales::hue_pal()(length(unique(seurat$Sample)))
+names(grid.cols) <- unique(seurat$Sample)
+
+#Graphing the chord diagram
+circlize::chordDiagram(circles, self.link = 1, grid.col = grid.cols)
+
+```
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# Time
+
+```{r endtime}
+# output time taken to run script
+end_tm <- Sys.time()
+end_tm
+end_tm - start_tm
+
+```

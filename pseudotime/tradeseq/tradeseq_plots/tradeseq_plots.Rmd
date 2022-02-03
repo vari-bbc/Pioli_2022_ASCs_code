@@ -1,0 +1,287 @@
+---
+title: "tradeseq_plots"
+author: "Kin Lau"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: true
+---
+
+```{r keep_figures, cache=TRUE}
+# this chunk is just to keep the _files directory even when we turn off cacheing
+```
+
+```{r starttime}
+# save start time for script
+start_tm <- Sys.time()
+start_tm
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE, cache.lazy = FALSE, dev=c('png','pdf'), fig.width=8, fig.height=8)
+
+```
+
+```{r make_outdir}
+outdir <- "./tradeseq_plots_out_files/"
+
+dir.create(outdir, recursive=TRUE)
+```
+
+# Packages loaded
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE}
+library(dplyr)
+library(stringr)
+library(readr)
+library(tradeSeq)
+library(pheatmap)
+library(ggplotify)
+library(dittoSeq)
+library(scran)
+library(scater)
+library(patchwork)
+library(slingshot)
+library(openxlsx)
+library(ggplot2)
+library(viridis)
+```
+
+# Read in results
+
+```{r read_results}
+sce_slingshot <- readRDS("../../pseudotime_out_files/slingshot_sce.rds")
+sce <- readRDS("../tradeseq_out_files/tradeseq_sce.rds")
+ATres <- readRDS("../tradeseq_out_files/ATres.rds")
+
+```
+
+# Replot pseudotime trajectories
+
+```{r plot_trajectories, fig.width=14, fig.height=4}
+pseudotime_cols <- grep(colnames(colData(sce_slingshot)), pattern = "slingPseudo", value = TRUE)
+names(pseudotime_cols) <- pseudotime_cols
+gg_list <- lapply(pseudotime_cols, function(x) {
+  #plotUMAP(sce_slingshot, colour_by=x) + 
+  dittoDimPlot(sce_slingshot, x) +
+    ggtitle(str_replace(x, "slingPseudotime", "Lineage"))
+}) 
+
+slingcurves <- slingCurves(sce_slingshot)
+
+# draw all lineages in each panel
+gg_list_w_curves <- gg_list
+lin_colors <- viridis(length(gg_list_w_curves))
+for (i in 1:length(slingcurves)) {
+  path <- slingcurves[[i]]
+  trajectory <- data.frame(path$s[path$ord,])
+  gg_list_w_curves <- lapply(gg_list_w_curves, function(x) x + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=lin_colors[i]))
+  #gg <- gg + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=i)
+}
+wrap_plots(gg_list_w_curves)
+
+# draw single lineage in each panel
+wrap_plots(
+  lapply(1:length(slingcurves), function(x){
+    path <- slingcurves[[x]]
+    trajectory <- data.frame(path$s[path$ord,])
+    gg_list[[x]] + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=lin_colors[x])
+  })
+)
+```
+
+# Replot pseudotime trajectories with clusters
+
+```{r plot_trajectories_w_clusters, fig.width=7, fig.height=5}
+cluster_res <- "integrated_snn_res.0.3"
+
+umap_w_slings <- dittoDimPlot(sce_slingshot, cluster_res)
+
+slingcurves <- slingCurves(sce_slingshot)
+
+for (i in 1:length(slingcurves)) {
+  path <- slingcurves[[i]]
+  trajectory <- data.frame(path$s[path$ord,])
+  umap_w_slings <- umap_w_slings + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=lin_colors[i])
+}
+umap_w_slings
+
+```
+
+# Plot sample proportion in each lineage
+
+```{r lineage_prop, fig.width=10, fig.height=4}
+pseudotime_cols <- grep(colnames(colData(sce)), pattern = "slingPseudo", value=TRUE)
+
+for (i in 1:length(pseudotime_cols)){
+  sce[[paste0("memb_of_lin_", i)]] <- ifelse(!is.na(colData(sce)[[paste0("slingPseudotime_", i)]]), "Member", "NotMember")
+}
+
+wrap_plots(
+  lapply(1:length(pseudotime_cols), function(x){
+    dittoBarPlot(sce, paste0("memb_of_lin_", x), group.by = "Sample", 
+                 split.by = "Tissue", retain.factor.levels=TRUE, 
+                 split.adjust=list(scales="free_x"),
+                 main=paste0("Lineage ", x))
+  })
+) + plot_layout(guides="collect")
+```
+
+# Plot sample proportion in each lineage, combined
+
+```{r lineage_prop_combined, fig.width=5, fig.height=4}
+lin_assignments <- slingBranchID(sce_slingshot)
+stopifnot(identical(names(lin_assignments), colnames(sce)))
+sce$lin_assignments <- lin_assignments
+dittoBarPlot(sce, "lin_assignments", group.by = "Sample", 
+             split.by = "Tissue", retain.factor.levels=TRUE, 
+             split.adjust=list(scales="free_x"),
+             main = "Lineage assignments")
+```
+
+
+# Plot heatmaps of top genes associated with pseudotime along each inferred lineage
+
+```{r pseudotime_genes_heatmap, fig.width=8, fig.height=14}
+lineage_pvals <- grep("^pvalue_\\d+$", colnames(ATres), value=TRUE)
+lineage_wald <- grep("^waldStat_\\d+$", colnames(ATres), value=TRUE)
+
+ht_plots <- lapply(1:length(lineage_pvals), function(x){
+  lin_genes <-  ATres[which(p.adjust(ATres[[paste0("pvalue_", x)]], "fdr") < 0.05), ]
+  lin_genes <- lin_genes[order(lin_genes[[paste0("waldStat_", x)]], decreasing = TRUE), ]
+  yhatSmooth <- predictSmooth(sce, gene = rownames(lin_genes)[1:max(c(length(lin_genes), 100))], 
+                              nPoints = 50, tidy = FALSE)
+  lin_name <- paste0("lineage", x)
+  as.ggplot(
+    pheatmap(t(scale(t(yhatSmooth[, str_detect(colnames(yhatSmooth), paste0(lin_name, "_"))]))),
+             cluster_cols = FALSE,
+             show_rownames = TRUE, 
+             show_colnames = FALSE, 
+             main=lin_name, 
+             silent=TRUE)
+  )
+})
+ht_plots
+#wrap_plots(ht_plots)
+
+```
+
+
+
+# Output results of associating each gene to pseudotime lineages
+
+
+```{r out_pseduotime_genes}
+ATres_cols <- colnames(ATres)
+ATres_cols <- ATres_cols[-length(ATres_cols)]
+
+ATres_cols_split <- split(ATres_cols, rep(1:(length(ATres_cols)/3), each = 3))
+names(ATres_cols_split) <- c("global", paste0("lineage_", 1:(length(ATres_cols_split)-1)))
+
+ATres_split <- lapply(ATres_cols_split, function(x) {
+  stopifnot(all(!is.na(rownames(ATres))))
+  
+  ATres[, x] %>% #c(x, "meanLogFC")] %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::rename_all(., function(y) str_remove(y, "_\\d+$")) %>%
+    dplyr::mutate(FDR=p.adjust(pvalue, "fdr")) %>%
+    dplyr::arrange(desc(waldStat)) %>% # pvalue) %>%
+    dplyr::filter(apply(., 1, function(y) sum(is.na(y))) < length(x)) # remove untested or unsuccessfully tested genes
+    #dplyr::filter(FDR < 0.05) # filter for significant genes only
+})
+
+write.xlsx(ATres_split, paste0(outdir, "pseudotime_genes.xlsx"), overwrite = TRUE)
+```
+
+# Pete's genes
+
+## Plot counts along pseudotime
+
+```{r plotSmoothers_prep_pete}
+genes <- c("S100a8", "S100a9", "S100a11", "Bcl2", "Bcl2l11", "Zeb2", "Vav3", "Cd93", "Ctla4")
+smoother_plots <- lapply(genes, function(x) plotSmoothers(sce, counts(sce), gene = x) + ggtitle(x))
+```
+
+```{r plotSmoothers_pete, fig.height=10, fig.width=12}
+wrap_plots(smoother_plots)
+```
+
+## Ly6c2 smoother plot
+
+```{r Ly6c2_smoother, fig.width=6.5, fig.height=5}
+smoother_plot_gene <- "Ly6c2"
+plotSmoothers(sce, counts(sce), gene = smoother_plot_gene) + ggtitle(smoother_plot_gene)
+```
+
+```{r umap_gene_counts_pete, fig.width=10, eval=FALSE}
+
+# multi_dittoDimPlot(sce_slingshot, genes, assay="logcounts",
+#                    order="increasing", size=0.7,
+#                    legend.show=TRUE, 
+#                    add.trajectory.curves = slingCurves(sce_slingshot))
+```
+
+
+# Top 12 Lineage 1
+
+## Plot counts along pseudotime
+
+```{r plotSmoothers_prep_topLin1}
+genes <- ATres_split$lineage_1$gene[1:12]
+smoother_plots <- lapply(genes, function(x) plotSmoothers(sce, counts(sce), gene = x) + ggtitle(x))
+```
+
+```{r plotSmoothers_topLin1, fig.height=10, fig.width=16}
+wrap_plots(smoother_plots, nrow = 3)
+```
+
+
+# Top 12 Lineage 2
+
+## Plot counts along pseudotime
+
+```{r plotSmoothers_prep_topLin2}
+genes <- ATres_split$lineage_2$gene[1:12]
+smoother_plots <- lapply(genes, function(x) plotSmoothers(sce, counts(sce), gene = x) + ggtitle(x))
+```
+
+```{r plotSmoothers_topLin2, fig.height=10, fig.width=16}
+wrap_plots(smoother_plots, nrow = 3)
+```
+
+
+# Top 12 Lineage 3
+
+## Plot counts along pseudotime
+
+```{r plotSmoothers_prep_topLin3}
+genes <- ATres_split$lineage_3$gene[1:12]
+smoother_plots <- lapply(genes, function(x) plotSmoothers(sce, counts(sce), gene = x) + ggtitle(x))
+```
+
+```{r plotSmoothers_topLin3, fig.height=10, fig.width=16}
+wrap_plots(smoother_plots, nrow = 3)
+```
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# Time
+
+```{r endtime}
+# output time taken to run script
+end_tm <- Sys.time()
+end_tm
+end_tm - start_tm
+
+```

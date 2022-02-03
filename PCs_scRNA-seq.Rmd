@@ -1,0 +1,185 @@
+---
+title: "PCs 10x"
+author: "Kin Lau"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: true
+---
+
+```{r starttime}
+# save start time for script
+start_tm <- Sys.time()
+start_tm
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=TRUE, cache.lazy = FALSE, dev=c('png','pdf'), fig.width=8, fig.height=8)
+
+```
+
+```{r make_outdir}
+outdir <- "./PCs_scRNAseq_out_files/"
+
+dir.create(outdir, recursive=TRUE)
+```
+
+# Packages loaded
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE}
+library(dplyr)
+library(stringr)
+library(readr)
+library(DropletUtils)
+library(scuttle)
+library(scater)
+library(Seurat)
+library(future)
+
+```
+
+# Read in counts
+```{r read_counts}
+raw_counts_dirs <- list.dirs("../cellranger_output/", recursive = TRUE) %>% 
+  grep("_PC\\/outs\\/filtered_feature_bc_matrix$", ., value=TRUE)
+names(raw_counts_dirs) <- str_extract(raw_counts_dirs, "[^\\/]+(?=\\/outs\\/filtered_feature_bc_matrix)")
+stopifnot(length(names(raw_counts_dirs)) == length(unique(names(raw_counts_dirs))))
+
+# get decoder for ensembl gene id to gene symbol from one of the features.tsv files.
+ens2gene <- read_tsv(paste0(raw_counts_dirs[1], "/features.tsv.gz"), 
+                     col_names = c("ens_gene","gene_sym", "assay_type"), 
+                     col_types="ccc") %>%
+  dplyr::select(ens_gene, gene_sym) %>%
+  unique()
+
+sce <- read10xCounts(raw_counts_dirs)
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$ID, rowData(sce)$Symbol)
+
+```
+
+# QC
+
+```{r qc}
+is.mito <- grepl("^mt-", rownames(sce))
+#sce <- addPerCellQC(sce, subsets=list(Mito=is.mito))
+df <- perCellQCMetrics(sce, subsets=list(Mito=is.mito))
+reasons <- quickPerCellQC(df, sub.fields=c("subsets_Mito_percent"), batch=sce$Sample) # perCellQCFilters() will also identify outliers for the proportion-based metrics specified in the sub.fields= arguments. These distributions frequently exhibit a heavy right tail, but unlike the two previous metrics, it is the right tail itself that contains the putative low-quality cells. Thus, we do not perform any transformation to shrink the tail - rather, our hope is that the cells in the tail are identified as large outliers. (While it is theoretically possible to obtain a meaningless threshold above 100%, this is rare enough to not be of practical concern.) -- OSCA
+
+# Cell removal reasons
+colSums(as.matrix(reasons))
+
+# add qc metrics to SCE
+colData(sce) <- cbind(colData(sce), df)
+sce$discard <- reasons$discard
+
+table(sce$Sample, ifelse(sce$discard,"Discard","Keep"))
+```
+
+# QC plots
+
+```{r qc_plots}
+gridExtra::grid.arrange(
+    plotColData(sce, x="Sample", y="sum", colour_by="discard") + 
+        scale_y_log10() + ggtitle("Total count"),
+    plotColData(sce, x="Sample", y="detected", colour_by="discard")  + 
+        scale_y_log10() + ggtitle("Detected features"),
+    plotColData(sce, x="Sample", y="subsets_Mito_percent", 
+        colour_by="discard") + ggtitle("Mito percent"),
+    ncol=1
+)
+```
+
+```{r qc_plots2, fig.width=4, fig.height=4}
+# "The aim is to confirm that there are no cells with both large total counts and large mitochondrial counts, to ensure that we are not inadvertently removing high-quality cells that happen to be highly metabolically active" -OSCA
+plotColData(sce, x="sum", y="subsets_Mito_percent", colour_by="discard")
+
+```
+
+# Filter cells and normalize
+
+```{r filter_cells_and_normalize}
+filtered <- sce[,!reasons$discard]
+filtered <- logNormCounts(filtered)
+
+write_rds(filtered, paste0(outdir, "filt_SCE.rds"))
+```
+
+# Convert to Seurat
+
+```{r to_seurat}
+filt.seurat <- as.Seurat(filtered, counts = "counts", data = "logcounts")
+filt.seurat <- NormalizeData(filt.seurat) # renormalize counts using Seurat way
+
+```
+
+# Integrate across samples
+
+```{r split_and_select_integration_feats}
+# split the dataset into a list of two seurat objects (stim and CTRL)
+filt.list <- SplitObject(filt.seurat, split.by = "Sample")
+
+# normalize and identify variable features for each dataset independently
+filt.list <- lapply(X = filt.list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = filt.list)
+```
+
+# Perform integration
+```{r integrate}
+plan("multisession", workers = 2)
+options(future.globals.maxSize = 5000 * 1024^2)
+
+integrate.anchors <- FindIntegrationAnchors(object.list = filt.list, anchor.features = features)
+
+plan("sequential")
+
+filt.combined <- IntegrateData(anchorset = integrate.anchors)
+
+```
+
+
+# Perform integrated analysis
+```{r integrated_analysis}
+# specify that we will perform downstream analysis on the corrected data note that the
+# original unmodified data still resides in the 'RNA' assay
+DefaultAssay(filt.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+filt.combined <- ScaleData(filt.combined, verbose = FALSE)
+filt.combined <- RunPCA(filt.combined, npcs = 60, verbose = FALSE)
+ElbowPlot(filt.combined, ndims = 60)
+
+filt.combined <- RunUMAP(filt.combined, reduction = "pca", dims = 1:30)
+filt.combined <- FindNeighbors(filt.combined, reduction = "pca", dims = 1:30)
+filt.combined <- FindClusters(filt.combined, resolution = c(seq(0.1, 0.9, 0.1)))
+
+write_rds(filt.combined, paste0(outdir, "integrated_Seurat.rds"))
+```
+
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# Time
+
+```{r endtime}
+# output time taken to run script
+end_tm <- Sys.time()
+end_tm
+end_tm - start_tm
+
+```

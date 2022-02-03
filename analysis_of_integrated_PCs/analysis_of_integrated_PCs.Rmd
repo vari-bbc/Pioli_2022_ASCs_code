@@ -1,0 +1,385 @@
+---
+title: "analysis_of_integrated_PCs"
+author: "Kin Lau"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: true
+    css: dont_overlap_toc.css
+---
+
+```{r starttime}
+# save start time for script
+start_tm <- Sys.time()
+start_tm
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=TRUE, cache.lazy = FALSE, dev=c('png','pdf'), fig.width=8, fig.height=8)
+
+```
+
+```{r make_outdir}
+outdir <- "./analysis_of_integrated_PCs_out_files/"
+
+dir.create(outdir, recursive=TRUE)
+```
+
+# Packages loaded
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE}
+library(dplyr)
+library(stringr)
+library(readr)
+library(Seurat)
+library(scran)
+library(dittoSeq)
+library(patchwork)
+library(openxlsx)
+library(tibble)
+```
+
+
+# Read in integrated Seurat object
+
+```{r read_integrated_seurat}
+seurat_integrated <- readRDS("../PCs_scRNAseq_out_files/integrated_Seurat.rds")
+seurat_integrated$Tissue <- str_extract(seurat_integrated$Sample, "BM|Thy|Sp")
+seurat_integrated$Indiv <- str_extract(seurat_integrated$Sample, "^(Kim|Pete)")
+```
+
+# UMAP plot with clusters
+
+```{r umap_plot_clusters, fig.width=12, fig.height=5}
+# cluster resolution to use for analyzing clusters
+cluster_res <- "integrated_snn_res.0.3"
+seurat_integrated[[cluster_res]] <- factor(seurat_integrated[[]][[cluster_res]], 
+                                    levels=as.character(sort(as.numeric(levels(seurat_integrated[[]][[cluster_res]]))))
+)
+Idents(seurat_integrated) <- "integrated_snn_res.0.3"
+
+dittoDimPlot(seurat_integrated, cluster_res, split.by = "Sample") +
+  dittoBarPlot(seurat_integrated, cluster_res, group.by = "Sample", 
+               split.by = "Tissue", retain.factor.levels=TRUE, split.adjust=list(scales="free_x")) + 
+  patchwork::plot_layout(widths = c(2,1))
+
+table(seurat_integrated$Sample, seurat_integrated[[]][[cluster_res]])
+
+table(seurat_integrated[[]][[cluster_res]])
+
+max.cells.per.ident.param <- 5000
+```
+
+# Plot technical metrics
+
+```{r tech_metrics_umap, fig.width=5}
+multi_dittoDimPlot(seurat_integrated, c("sum", "detected", "subsets_Mito_percent"), legend.show=TRUE,
+                   order="increasing", size=0.7)
+
+```
+
+
+# Plot marker genes
+
+```{r umap_genes, fig.width=10}
+# Prdm1, Xbp1, Sdc1, Ell2 should be in just about all PCs (See Shi et al. 2015, Figure 1 for genes), Mcm3, Mcm4 and Ccna2 should segregate with a portion of plasma cells (plasmablasts) that are still proliferating (See Shi et al. 2015, Figure 2 for genes) 
+
+marker_genes <- list(all_PCs = c("Prdm1", "Xbp1", "Sdc1", "Ell2"), 
+                     proliferating_PCs = c("Mcm3", "Mcm4", "Ccna2"))
+
+multi_dittoDimPlot(seurat_integrated, unlist(marker_genes), assay="originalexp", slot="data",
+                   order="increasing", size=0.7, legend.show=TRUE)
+```
+
+```{r dotplto_genes, fig.width=10}
+dittoDotPlot(seurat_integrated, vars = unlist(marker_genes), group.by = "ident", assay="originalexp", slot="data")
+```
+
+```{r set_scran_min_prop}
+scran_min_prop <- 0.75
+```
+
+
+# Find marker genes for each cluster using a different method: scran
+
+This makes pair-wise comparisons with every other cluster. The final results are the genes that were most significant (highly ranked) in `r scran_min_prop` or more of the pair-wise comparisons.
+
+```{r find_cluster_markers_scran, fig.height=5}
+seurat_integrated.sce <- as.SingleCellExperiment(seurat_integrated, assay = "originalexp")
+seurat_integrated.sce <- logNormCounts(seurat_integrated.sce) # renormalize counts using scran way; should not matter for Wilcox tests
+
+seurat_integ.sce.markers <- findMarkers(seurat_integrated.sce, 
+                                        groups = seurat_integrated.sce[[cluster_res]],
+                                        block=seurat_integrated.sce$Sample, # For each gene, each pairwise comparison between clusters is performed separately in each level of the blocking factor
+                                        sorted = TRUE,
+                                        pval.type="any",
+                                        direction="up", # look only for genes up-regulated in a cluster
+                                        min.prop=scran_min_prop, # combination of pval.type="any" and min.prop=n means Top <= N are genes that are top N in at least 'scran_min_prop' of the comparisons
+                                        test.type = "wilcox")
+
+write_rds(seurat_integ.sce.markers, paste0(outdir, "cluster.top.markers.scran.rds"))
+
+# output cluster marker genes to excel
+seurat_integ.sce.markers_df <- lapply(seurat_integ.sce.markers, function(x) x %>% as.data.frame() %>% tibble::rownames_to_column("Gene"))
+write.xlsx(seurat_integ.sce.markers_df, paste0(outdir, "/PCs_cluster_marker_genes.xlsx"), overwrite = TRUE)
+
+topN <- 30
+FDR_cutoff <- 0.05
+seurat_integ.sce.markers_topN <- lapply(seurat_integ.sce.markers, function(x) x[x$Top <= topN & x$FDR < FDR_cutoff, ])
+sapply(seurat_integ.sce.markers, function(x) sum(x$Top <= topN)) # number of genes that were top N in 'min.prop' comparisons
+sapply(seurat_integ.sce.markers, function(x) sum(x$FDR < FDR_cutoff)) # number of genes with FDR < FDR_cutoff
+sapply(seurat_integ.sce.markers, function(x) sum(x$Top <= topN & x$FDR < FDR_cutoff)) # number of genes that were top N in 'min.prop' comparisons and also had FDR < FDR_cutoff
+
+```
+
+
+## Heatmap
+
+In these heatmaps, the log normalized counts, scaled so that the maximum value per row is 1, are plotted. We plot the genes that were top `r topN` in `r scran_min_prop` of the pair-wise comparisons and also had FDR < `r FDR_cutoff`.
+
+We plot only heatmaps with 2 or more genes. Otherwise the heatmap function errors out.
+
+```{r heatmap_cluster_markers, fig.width=12}
+ht_genes_list <- lapply(seurat_integ.sce.markers_topN, function(x) rownames(x))
+
+# plot DE genes for each cluster in a separate heatmap
+ht_plots <- lapply(names(ht_genes_list[sapply(ht_genes_list, length) > 1]), function(x) dittoHeatmap(seurat_integrated, ht_genes_list[[x]], annot.by = c(cluster_res, "Sample"), assay="originalexp", slot="data", scaled.to.max=TRUE, main=paste0("Cluster ", x," markers"), heatmap.colors.max.scaled=colorRampPalette(c("blue", "white", "red"))(50)))
+
+```
+
+
+
+# Find genes DE between samples in each cluster
+
+Here, we simply look for DE genes between pairs of samples within each cluster.
+
+```{r find_de_markers, fig.height=5}
+# For performing differential expression, we switch back to the original data
+DefaultAssay(seurat_integrated) <- "originalexp"
+
+# set sample-cluster as ident
+seurat_integrated$Sample_cluster <- paste0(seurat_integrated$Sample, "_", seurat_integrated[[]][[cluster_res]])
+Idents(seurat_integrated) <- seurat_integrated$Sample_cluster
+
+# get average expression values
+avg_expr <- AverageExpression(object = seurat_integrated, slot="data")
+avg_expr_origExp <- log2(avg_expr$originalexp + 1)
+
+find_de_btw_samples_in_each_cluster <- function(seurat_obj, sample1, sample2, cluster_col){
+  clusters <- levels(seurat_obj[[]][[cluster_col]])
+  names(clusters) <- clusters
+  
+  lapply(clusters, function(x) {
+    group1 <- paste0(sample1, "_", x)
+    group2 <- paste0(sample2, "_", x)
+    
+    num_cells1 <- sum(seurat_obj$Sample_cluster == group1)
+    num_cells2 <- sum(seurat_obj$Sample_cluster == group2)
+    
+    min_cells <- 20
+    lfc_cutoff <- 0.5
+    
+    if(num_cells1 > min_cells & num_cells2 > min_cells){
+      
+      out_df <- FindMarkers(seurat_obj,  slot = "data", assay="originalexp", 
+                            ident.1  = group1, ident.2 = group2, 
+                            logfc.threshold = lfc_cutoff, # based on combing through the docs and code, this is log2 scale
+                            verbose = FALSE) %>% dplyr::mutate(cluster=x, group1=group1, group2=group2)
+      
+      stopifnot(all(rownames(out_df) %in% rownames(avg_expr_origExp)))
+      stopifnot(all(c(group1, group2) %in% colnames(avg_expr_origExp)))
+      avg_expr_cols <- avg_expr_origExp[rownames(out_df), c(group1, group2)]
+      
+      stopifnot(identical(rownames(out_df), rownames(avg_expr_cols)))
+      out_df <- cbind(out_df, avg_expr_cols)
+      
+      return(out_df)
+    } else{
+      return(paste0("Too few cells in cluster", x, ": group1=", num_cells1, "; group2=", num_cells2)) 
+    }
+  })
+}
+
+btw_samples_DE_params <- list(
+  Pete_v_Kim_BM=list("Pete_BM_PC", "Kim_BM_PC"),
+  Pete_v_Kim_Sp=list("Pete_Sp_PC", "Kim_Sp_PC"),
+  Pete_v_Kim_Thy=list("Pete_Thy_PC", "Kim_Thy_PC"),
+  Sp_v_Thy_Pete=list("Pete_Sp_PC", "Pete_Thy_PC"),
+  Sp_v_BM_Pete=list("Pete_Sp_PC", "Pete_BM_PC"),
+  BM_v_Thy_Pete=list("Pete_BM_PC", "Pete_Thy_PC"),
+  Sp_v_Thy_Kim=list("Kim_Sp_PC", "Kim_Thy_PC"),
+  Sp_v_BM_Kim=list("Kim_Sp_PC", "Kim_BM_PC"),
+  BM_v_Thy_Kim=list("Kim_BM_PC", "Kim_Thy_PC")
+)
+
+DE.markers <- lapply(btw_samples_DE_params, function(func_params) {
+  message(paste0("Working on : ", paste(func_params, collapse=", ")))
+  do.call(find_de_btw_samples_in_each_cluster, c(seurat_integrated, func_params, cluster_res))
+})
+
+names(DE.markers) <- names(btw_samples_DE_params)
+
+write_rds(DE.markers, paste0(outdir, "DE.markers.rds"))
+
+str(DE.markers, max.level = 2)
+```
+
+```{r signif_markers}
+# remove results for clusters that were not tested due to too few cells
+DE.markers <- lapply(DE.markers, function(x){
+  x[sapply(x, is.data.frame)]
+})
+
+p_val_adj_cutoff <- 0.05
+
+# get significant genes
+DE.markers_signif <- lapply(DE.markers, function(x){
+  lapply(x, function(y) y %>% dplyr::filter(p_val_adj < p_val_adj_cutoff))
+})
+DE.markers_signif <- lapply(DE.markers_signif, function(x){
+  x[sapply(x, function(y) nrow(y) > 0)] # remove tests with no significant results
+})
+
+# convert to tibble then output to file
+DE.markers_signif_tbl <- lapply(DE.markers_signif, function(x){
+  lapply(x, function(y) y %>% tibble::rownames_to_column("Gene") %>% as_tibble() %>% tibble::remove_rownames())
+})
+
+# output to Excel
+invisible(
+  lapply(names(DE.markers_signif_tbl), function(x) {
+    write.xlsx(DE.markers_signif_tbl[[x]], paste0(outdir, "/", x, "_DE.xlsx"), overwrite = TRUE)
+  })
+)
+#DE.markers_signif_tbl_rbind <- do.call(rbind, DE.markers_signif_tbl)
+#write_tsv(DE.markers_signif_tbl_rbind, paste0(outdir, "/GCBs_DE_btw_sex.tsv"))
+```
+
+
+```{r heatmap_intracluster_comparisons, fig.height=7, fig.width=15}
+ht_genes_list <- lapply(DE.markers_signif, function(x) {
+  unique(unlist(lapply(x, function(y) rownames(y)[1:min(10, nrow(y))]))) # top N genes from each comparison
+})
+
+# list of DFs to indicate whether each cluster was significant for a particular gene for each comparison
+ht_genes_DEorNot <- lapply(rlang::set_names(names(ht_genes_list), names(ht_genes_list)), function(x){
+  df <- Reduce(function(a,b) left_join(a, b, by="Gene"), 
+         lapply(names(DE.markers_signif_tbl[[x]]), function(y){
+           df <- tibble(Gene=ht_genes_list[[x]])
+           df[[y]] <- ifelse(df$Gene %in% DE.markers_signif_tbl[[x]][[y]]$Gene,
+                             "DE", "notDE")
+           df
+         })
+  ) 
+  
+  cols <- as.character(levels(seurat_integrated[[]][[cluster_res]]))
+  names(cols) <- cols
+  cols <- unlist(lapply(cols, function(x) "notDE"))
+  
+  add_column(df, !!!cols[setdiff(names(cols), names(df))]) %>% 
+    tibble::column_to_rownames("Gene") %>% 
+    dplyr::select(as.character(sort(as.numeric(colnames(.)), decreasing = TRUE))) # sort clusters by numerical order
+  
+})
+
+cluster_names <- as.character(levels(seurat_integrated[[]][[cluster_res]]))
+ht_ann_colors <- lapply(rlang::set_names(cluster_names, cluster_names), function(x){
+  c(notDE = "white", DE = "firebrick")
+})
+
+# plot DE genes for each comparison in a separate heatmap
+ht_plots <- lapply(names(ht_genes_list), function(x) {
+  
+  cells_to_plot <- rownames(seurat_integrated[[]])[str_remove(seurat_integrated[[]]$Sample_cluster, "_\\d+$") %in% 
+                                                             unlist(btw_samples_DE_params[[x]])]
+  
+  dittoHeatmap(seurat_integrated, genes = ht_genes_list[[x]],
+               cells.use = cells_to_plot,
+               annot.by = c(cluster_res, "Sample"), assay="originalexp", 
+               slot="data", scaled.to.max=TRUE, main=paste0(x," top DE"), 
+               annotation_row=ht_genes_DEorNot[[x]],
+               annotation_colors = ht_ann_colors,
+               heatmap.colors.max.scaled=colorRampPalette(c("blue", "white", "red"))(50))
+})
+
+```
+
+
+# Output normalized expression
+
+```{r out_norm_expr}
+get_mean_and_sd_by_ident <- function(seurat_obj, assay="originalexp"){
+  avg_expr <- AverageExpression(seurat_obj, slot="data")[[assay]] # in documentation, it is stated that if the slot is set to "data", AverageExpression() "assumes that the data has been log normalized and therefore feature values are exponentiated prior to averaging so that averaging is done in non-log space." 
+  
+  split_by_ident <- SplitObject(seurat_obj)
+  
+  sd_split_by_ident <- lapply(names(split_by_ident), function(x) {
+    expr <- GetAssayData(object = split_by_ident[[x]], slot="data", assay = assay)
+    df <- data.frame(row.names = rownames(expr))
+    df[[paste0(x,".sd")]] <- apply(expm1(expr), 1, sd)
+    df
+  })
+  
+  sd_by_ident_df <- do.call(cbind, sd_split_by_ident)
+  mean_and_sd <- cbind(avg_expr, sd_by_ident_df) %>%
+    dplyr::select(sort(colnames(.))) %>%
+    tibble::rownames_to_column("Gene")
+  
+  mean_and_sd
+}
+
+# split by celltype_samp
+Idents(seurat_integrated) <- seurat_integrated$Sample_cluster
+mean_and_sd_by_Sample_cluster <- get_mean_and_sd_by_ident(seurat_integrated)
+
+# sanity check
+test_cluster <- "Kim_Sp_PC_5"
+split_obj <- SplitObject(seurat_integrated)
+expr <- expm1(GetAssayData(object = split_obj[[test_cluster]], slot="data", assay = "originalexp"))
+summ_df <- data.frame(mean=apply(expr, 1, mean), sd=apply(expr, 1, sd))
+testthat::expect_equivalent(mean_and_sd_by_Sample_cluster[[test_cluster]], summ_df$mean)
+testthat::expect_equivalent(mean_and_sd_by_Sample_cluster[[paste0(test_cluster,".sd")]], summ_df$sd)
+
+# split by celltype
+Idents(seurat_integrated) <- seurat_integrated[[]][[cluster_res]]
+mean_and_sd_by_cluster <- get_mean_and_sd_by_ident(seurat_integrated)
+
+# sanity check 2
+test_cluster <- "7"
+split_obj <- SplitObject(seurat_integrated)
+expr <- expm1(GetAssayData(object = split_obj[[test_cluster]], slot="data", assay = "originalexp"))
+summ_df <- data.frame(mean=apply(expr, 1, mean), sd=apply(expr, 1, sd))
+testthat::expect_equivalent(mean_and_sd_by_cluster[[test_cluster]], summ_df$mean)
+testthat::expect_equivalent(mean_and_sd_by_cluster[[paste0(test_cluster,".sd")]], summ_df$sd)
+
+
+# output to Excel
+write.xlsx(mean_and_sd_by_cluster, 
+           file = paste0(outdir, "/mean_and_sd_of_UMIcounts_per_cluster.xlsx"), overwrite = TRUE)
+
+write.xlsx(mean_and_sd_by_Sample_cluster, 
+           file = paste0(outdir, "/mean_and_sd_of_UMIcounts_per_sample_cluster.xlsx"), overwrite = TRUE)
+```
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# Time
+
+```{r endtime}
+# output time taken to run script
+end_tm <- Sys.time()
+end_tm
+end_tm - start_tm
+
+```

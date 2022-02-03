@@ -1,0 +1,129 @@
+---
+title: "pseudotime"
+author: "Kin Lau"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: true
+---
+
+```{r starttime}
+# save start time for script
+start_tm <- Sys.time()
+start_tm
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=TRUE, cache.lazy = FALSE, dev=c('png','pdf'), fig.width=8, fig.height=8)
+
+```
+
+```{r make_outdir}
+outdir <- "./pseudotime_out_files/"
+
+dir.create(outdir, recursive=TRUE)
+```
+
+# Packages loaded
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE}
+library(dplyr)
+library(stringr)
+library(readr)
+library(Seurat)
+library(scran)
+library(dittoSeq)
+library(patchwork)
+library(openxlsx)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(scater)
+library(tradeSeq)
+library(BiocParallel)
+```
+
+# Read in integrated Seurat object
+
+```{r read_integrated_seurat}
+seurat_integrated <- readRDS("../PCs_scRNAseq_out_files/integrated_Seurat.rds")
+seurat_integrated$Tissue <- str_extract(seurat_integrated$Sample, "BM|Thy|Sp")
+seurat_integrated$Indiv <- str_extract(seurat_integrated$Sample, "^(Kim|Pete)")
+# cluster resolution to use for analyzing clusters
+cluster_res <- "integrated_snn_res.0.3"
+seurat_integrated[[cluster_res]] <- factor(seurat_integrated[[]][[cluster_res]], 
+                                    levels=as.character(sort(as.numeric(levels(seurat_integrated[[]][[cluster_res]]))))
+)
+Idents(seurat_integrated) <- cluster_res
+
+```
+
+# Infer trajectories
+
+We set the root at cluster 11 because this had high expression of proliferative markers.
+
+```{r slingshot}
+# # We keep only the unintegrated counts
+seurat_integrated.sce <- as.SingleCellExperiment(seurat_integrated, assay = "originalexp")
+#seurat_integrated.sce$slingshot_clust <- paste0("k", as.character(colData(seurat_integrated.sce)[[cluster_res]]))
+# #seurat_integrated.sce.integ <- as.SingleCellExperiment(seurat_integrated, assay = "integrated")
+#plotUMAP(seurat_integrated.sce, colour_by=cluster_res)
+sce <- slingshot(seurat_integrated.sce, reducedDim = 'UMAP', 
+                  clusterLabels = colData(seurat_integrated.sce)[[cluster_res]], start.clus = "11", 
+                  approx_points=150)
+
+```
+
+```{r plot_trajectories, fig.width=14, fig.height=4}
+# colors <- colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)
+# plotcol <- colors[cut(sce$slingPseudotime_1, breaks=100)]
+# 
+# plot(reducedDims(sce)$UMAP, col = plotcol, pch=16, asp = 1)
+# lines(SlingshotDataSet(sce), lwd=2, col='black')
+
+pseudotime_cols <- grep(colnames(colData(sce)), pattern = "slingPseudo", value = TRUE)
+names(pseudotime_cols) <- pseudotime_cols
+gg_list <- lapply(pseudotime_cols, function(x) plotUMAP(sce, colour_by=x) + ggtitle(str_replace(x, "slingPseudotime", "Lineage"))) 
+
+slingcurves <- slingCurves(sce)
+
+for (i in 1:length(slingcurves)) {
+  path <- slingcurves[[i]]
+  trajectory <- data.frame(path$s[path$ord,])
+  gg_list <- lapply(gg_list, function(x) x + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=i))
+  #gg <- gg + geom_path(data=trajectory, aes(x=UMAP_1, y=UMAP_2), size=1.2, color=i)
+}
+wrap_plots(gg_list)
+
+# Look at how many cells assigned to each combination of lineages
+curve.assignments <- slingBranchID(sce)
+table(curve.assignments)
+
+write_rds(sce, paste0(outdir, "slingshot_sce.rds"))
+
+```
+
+
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# Time
+
+```{r endtime}
+# output time taken to run script
+end_tm <- Sys.time()
+end_tm
+end_tm - start_tm
+
+```
